@@ -1,0 +1,473 @@
+---
+title: "Analysing Gene Expression Data from High throughput sequencing (RNAseq)"
+author: "Sebastien Renaut"
+date: '2017-04-24'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Goals of the R workshop:
+####Learn the basics of high throughput sequencing.
+####Learn the basics of gene expression analysis in R.
+####Learn some R tricks along the way.
+
+###1.Loading expression file + experimental setup.
+```{r, echo=T}
+#First let's set up experimental info and look at the data
+indi = c("S1","S2","S3","S4","N1","N2","N3","N4")
+group <- factor(c("South","South","South","South","North","North","North","North"))
+
+#raw read counts was computed from the program "samtools idxstats" (http://www.htslib.org/)
+#samtools idxstats retrieves and print stats corresponding to the input Binary Sequence Alignment Map (BAM) file.
+#The output is TAB-delimited with each line consisting of reference sequence name, sequence length, # mapped reads and # unmapped reads. It is written to stdout.
+
+#Here I have prepared this file with information from all 8 individuals...
+idxstats = read.table("../reference/idxstats", stringsAsFactors = F)
+
+#What does it look like? 
+head(idxstats)
+
+#How many genes are there?
+nrow(idxstats)
+
+#The last line is total number of reads per individual.
+tail(idxstats)
+
+#Try to get a sense of the expression numbers (many genes not expressed. Few highly expressed. Several moderately expressed. Several very lowly expressed...)
+
+#But looking at raw read counts to infer differences is not very usefull...
+```
+
+###2.FPKM (Fragment per thousand base pairs per million mapped reads)
+```{r, echo=T}
+#There are two main biases in the raw read counts: length and nb reads in library (look at column 2 and look at last line of the idxstats matrix)
+#Originally, researchers would correct (normalize) for them, then apply statistical tests.
+#How can we correct for them?
+#Originally researchers used "FPKM": Fragments ("sequence" or "read") per thousand base pairs per million mapped reads
+#FPKM normalizes for both these issues...
+
+reads_per_thousand_basepairs = idxstats[1,3] / (idxstats[1,2] / 1000)
+reads_per_thousand_basepairs_per_M_mapped_reads = reads_per_thousand_basepairs / (idxstats[1001,3]/1000000)
+  
+#loop it for all 8 individuals
+fpkm = idxstats
+for(i in 1:length(indi))
+{
+  #nb of read divided by number of basepairs / 1000
+	reads_per_thousand_basepairs = idxstats[1:1000,i+2] / (idxstats[1:1000,2] / 1000) 
+	
+	#reads_per_thousand_basepairs divided by total number of mapped reads / 1M
+	reads_per_thousand_basepairs_per_M_mapped_reads =  reads_per_thousand_basepairs / (idxstats[1001,i+2]/1000000) 
+	fpkm[1:1000,i+2] = round(reads_per_thousand_basepairs_per_M_mapped_reads)
+	if(i ==8) fpkm = fpkm[-c(1001),]
+}
+
+#Now we could look at this file to have a sense of expression differences.
+head(fpkm)
+```
+
+###3.Quantify gene expression (edgeR bioconductor package)
+Bioconductor (bioconductor.org) provides tools for the analysis and comprehension of high-throughput genomic data. It uses the R statistical programming language, and is open source and open development. It has two releases each year, 1296 software packages, and an active user community.
+
+edgeR (Empirical Analysis of Digital Gene Expression Data in R) is a package for the differential expression analysis of digital gene expression data, that is, of count data arising from DNA sequencing technologies. (https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf)
+
+edgeR is concerned with differential expression analysis rather than with the quantification of expression levels. It is concerned with relative changes in expression levels between conditions, but not directly with estimating absolute expression levels.
+
+```{r, echo=T}
+#You need edgeR package
+#You can install it from here:source("https://bioconductor.org/biocLite.R"); biocLite("edgeR")
+library(edgeR)
+
+##Remember the groups (North and South populations)
+print(group)
+
+#Need to specify a model
+design = model.matrix(~group)
+
+#Build DGEList object in the edgeR format...
+gene_expression_data = DGEList(counts=idxstats[-c(1001),3:10],group=group, genes = idxstats[-c(1001),1]) 
+
+#What does this object look like?
+print(gene_expression_data)
+```
+
+###3.1.Filtering
+Genes with very low counts across all libraries provide little evidence for differential expression.
+In the biological point of view, a gene must be expressed at some minimal level before
+it is likely to be translated into a protein or to be biologically important. In addition, the
+pronounced discreteness of these counts interferes with some of the statistical approximations
+that are used later in the pipeline. These genes should be filtered out prior to further
+analysis.
+
+As a rule of thumb, genes are dropped if they can’t possibly be expressed in all the samples
+for any of the conditions. Users can set their own definition of genes being expressed. Usually
+a gene is required to have a count of 5-10 in a library to be considered expressed in that
+library. Users should also filter with count-per-million (CPM) rather than filtering on the
+counts directly, as the latter does not account for differences in library sizes between samples.
+
+```{r, echo=T}
+#We can filter out lowly expressed genes using the following commands
+counts_per_million = cpm(gene_expression_data)
+keep = rowSums(counts_per_million) >= 100
+gene_expression_data = gene_expression_data[keep, , keep.lib.sizes=FALSE]
+
+#How many genes did we filter out?
+print(gene_expression_data)
+```
+
+###3.2.Normalization
+Note that normalization in edgeR is model-based, and the original read counts are not themselves transformed. This means that users should not transform the read counts in any way before loading them to edgeR. For example, users should not enter FPKM values to edgeR in place of read counts. Such quantities will prevent edgeR from correctly estimating the mean-variance relationship in the data, which is a crucial to the statistical strategies underlying edgeR. Similarly, users should not add artificial values to the counts before inputing them to edgeR.
+
+edgeR is concerned with relative changes in expression levels, not directly with estimating absolute expression levels. This greatly simplifies the technical influences that need to be taken into account, because any technical factor that is unrelated to the experimental conditions should cancel out of any differential expression analysis. For example, read counts can generally be expected to be proportional to length as well as to expression for any transcript, but edgeR does not generally need to adjust for gene length because gene length has the same relative influence on the read counts for each RNA sample. For this reason, normalization issues arise only to the extent that technical factors have sample-specific effects.
+
+The most obvious technical factor that affects the read counts, other than gene expression levels, is the sequencing depth (library size) of each RNA sample. edgeR adjusts any differential expression analysis for varying sequencing depths as represented by differing library sizes. This is part of the basic modeling procedure and flows automatically into fold-change or p-value calculations. It is always present, and doesn’t require any user intervention.
+
+The second important technical influence on differential expression is one that is less obvious. RNA-seq provides a measure of the relative abundance of each gene in each RNA sample, but does not provide any measure of the total RNA output on a per-cell basis. See "Normalization for RNA composition" below:
+
+```{r, echo=T}
+###Normalization for RNA composition
+#A normalization factor below one indicates that a small number of high count genes are monopolizing the sequencing, causing the counts for other genes to be lower than would be usual given the library size. As a result, the library size will be scaled down, analogous to scaling the counts upwards in that library. Conversely, a factor above one scales up the library size, analogous to downscaling the counts.
+gene_expression_data_norm <- calcNormFactors(gene_expression_data,method = "TMM")
+
+print(gene_expression_data_norm$samples)
+```
+
+###3.3 (simple) Modelling gene expression using the quantile-adjusted conditional maximum likelihood (qCML) method for experiments with single factor.
+```{r, echo=T}
+#Estimates dispersions parameters: common dispersion (variance in expression between samples for all genes), and tagwise dispersion (variance in expression between for each gene)
+y <- estimateDisp(gene_expression_data_norm, design = design)
+
+#The exact test for the negative binomial distribution has strong parallels with Fisher’s exact test.
+gene_expression_data_norm_exactTest = exactTest(y)
+
+#What does this new object look like?
+print(gene_expression_data_norm_exactTest)
+
+```
+
+###3.4 (more complex) Modelling gene expression using a generalized linear model (GLM)
+```{r, echo=T}
+#Estimates a common negative binomial dispersion parameter for a DGE dataset with a general experimental design (overall variance in expression between samples for all genes)
+gene_expression_data_norm <- estimateGLMCommonDisp(gene_expression_data_norm,design) 
+
+#Compute an empirical Bayes estimate of the negative binomial dispersion parameter for each tag, with expression levels specified by a log-linear model. (variance in expression for each gene)
+gene_expression_data_norm <- estimateGLMTagwiseDisp(gene_expression_data_norm,design)
+
+#Estimates the abundance-dispersion trend by Cox-Reid approximate profile likelihood. (variance in expression for each gene BUT according to expression: i.e. low expression genes are more variable...)
+gene_expression_data_norm <- estimateGLMTrendedDisp(gene_expression_data_norm,design)
+
+#Fit a negative binomial generalized log-linear model to the read counts for each gene.
+gene_expression_data_norm_fitted <- glmFit(gene_expression_data_norm,design)
+
+#Likelihood Ratio Test (carefull about which contrast you are making when you have >2 groups: see constrast option)
+gene_expression_data_norm_fitted_lrt <- glmLRT(gene_expression_data_norm_fitted)
+```
+
+###3.5 Identify differentially expressed genes (DEG)
+```{r, echo=T}
+#topTags allows to identify the n genes showing the highest expression differences.
+#Look at the different column headings. What do they mean?
+#What are p-values and FDR?
+#What are logFC?
+topten_NvsS = topTags(gene_expression_data_norm_fitted_lrt, n = 5)
+
+print(topten_NvsS)
+
+#How many genes are significantly differentially expressed?
+#Sometimes you may decide to add an expression cutoff to identify DEG
+#Table of the significant genes
+NvsS = topTags(gene_expression_data_norm_fitted_lrt, n = 1000)
+N2S_signif = NvsS[[1]][NvsS[[1]][,5] < 0.05,] 
+
+nrow(N2S_signif)
+head(N2S_signif[,1])
+
+#Xan we find the FPKM value (normalised expression for the gene with highest pvalue?)
+print(fpkm[fpkm[,1] == "comp8464_c0_seq2", ])
+
+
+```
+
+
+###4. Making plots
+```{r, echo=T}
+
+###plotSmear default
+plotSmear(gene_expression_data_norm_fitted_lrt)
+
+###Let's add colors to identify the DEG.
+deg = rownames(topTags(gene_expression_data_norm_fitted_lrt, n = nrow(N2S_signif)))
+plotSmear(gene_expression_data_norm_fitted_lrt,de.tags = deg, ylab = "Fold Change (North-South)")
+
+###Can we label the top five DEG?
+x = topTags(gene_expression_data_norm_fitted_lrt, n = 5)[[1]]$logCPM
+y = topTags(gene_expression_data_norm_fitted_lrt, n = 5)[[1]]$logFC
+labels = topTags(gene_expression_data_norm_fitted_lrt, n = 5)[[1]]$genes                                        
+text(x,y,labels,cex = 0.5)
+
+dev.print(device = pdf,"../figures/DEG.pdf")
+dev.off()
+```
+
+###5. heatmaps and clustering
+Loading RNA-seq counts to clustering or heatmap routines designed for microarray data is not straight-forward, and the best way to do this is still a matter of research. To draw a heatmap of individual RNA-seq samples, we suggest using moderated log-counts-per-million. This can be calculated by cpm and produces a matrix of log2 counts-per-million (logCPM), with undefined values avoided and the poorly defined log-fold-changes for low counts shrunk towards zero. The logCPM values can optionally be converted to RPKM or FPKM by subtracting log2 of gene length, see rpkm().
+
+```{r, echo=T}
+library(gplots)
+#library(marray)
+
+#You can also use the function cpm to calculate log2 CPM. We will use this to plot our heatmap...
+logcpm <- cpm(gene_expression_data_norm, prior.count=2, log=TRUE)
+rownames(logcpm) = (gene_expression_data_norm$genes[,1])
+
+#Default (hurts my eyes)
+heatmap.2(logcpm)
+
+###Keep only DEG that are highly expressed and above a logcpm of 11 (remember expression values are logged...)
+logcpm_DEG = logcpm[NvsS[[1]][,5] < 0.05,]
+logcpm_DEG_highly_expressed = logcpm_DEG[rowMeans(logcpm_DEG)>11,]
+
+#Make another (prettier?) color palette
+palettte <- colorRampPalette(c("yellow","darkblue"))
+
+#Better heatmap
+heatmap.2(logcpm_DEG_highly_expressed, density.info = "none", margins = c(5, 12),trace = "none", xlab = "samples", ylab = "genes",col= palettte(100))
+
+dev.print(device = pdf,"../figures/DEG_heatmap.pdf")
+dev.off()
+```
+
+###6. gene ontology
+The gene ontology (GO) enrichment analysis is the most common downstream procedures to interpret the differential expression results in a biological context. Given a set of genes that are up- or down-regulated under a certain contrast of interest, a GO enrichment analysis will find which GO terms that are over- or under-represented using annotations for the genes in that set.
+
+EdgeR provides a way to do this using goana {limma} but is essentially geared towards model systems. Goseq provides a way to do this for non model organism for which no info is available a priori. The are a number of steps (blast searches) that must be done before this analysis can be undertaken, and that will not be detailed further here. Users should also look into Trinotate (https://trinotate.github.io/) in order to identify a list of GO features for their genes.
+
+###(commands 6.1 to 6.6 are not run)
+
+###6.1.First install the required databases
+read this: https://trinotate.github.io/
+(Note that I run the commands from below in rnaseq_workshop/reference)
+
+###6.2.Run transdecoder to find longest orf
+system("./Users/jerry/Applications/TransDecoder-3.0.1/TransDecoder.LongOrfs -t genes1000.fasta")
+system("./Users/jerry/Applications/TransDecoder-3.0.1/TransDecoder.Predict -t genes1000.fasta")
+
+###6.3.Then blastx + blastp (against swissprot: curated database of proteins...)
+system("blastx -query genes1000.fasta -db /Users/jerry/Applications/Trinotate-3.0.2/blast_database/uniprot_sprot.pep -num_threads 3 -max_target_seqs 1 -outfmt 6 >genes1000blastx.outfmt6")
+system("blastp -query /Users/jerry/Applications/TransDecoder-3.0.1/genes1000.fasta.transdecoder.pep -db /Users/jerry/Applications/Trinotate-3.0.2/blast_database/uniprot_sprot.pep -num_threads 2 -max_target_seqs 1 -outfmt 6 >genes1000blastp.outfmt6")
+
+###6.4.Then load info into sql database
+system("Trinotate /Users/jerry/Applications/Trinotate-3.0.2/admin/Trinotate.sqlite init --gene_trans_map genes1000.gene_trans_map --transcript_fasta genes1000.fasta --transdecoder_pep genes1000.fasta.transdecoder.pep")
+
+system("Trinotate /Users/jerry/Applications/Trinotate-3.0.2/admin/Trinotate.sqlite LOAD_swissprot_blastp genes1000.blastp.outfmt6")
+
+system("Trinotate /Users/jerry/Applications/Trinotate-3.0.2/admin/Trinotate.sqlite LOAD_swissprot_blastx genes1000.blastx.outfmt6")
+
+###6.5.Output annotation
+system("Trinotate /Users/jerry/Applications/Trinotate-3.0.2/admin/Trinotate.sqlite report >trinotate_annotation_report.tsv")
+
+###6.6.Extract go annotation from database
+system("~/Applications/Trinotate-3.0.2/util/extract_GO_assignments_from_Trinotate_xls.pl --Trinotate_xls trinotate_annotation_report.tsv -G --include_ancestral_terms >genes1000.go_annotations.tsv")
+
+
+
+```{r, echo=T}
+
+###This script below is to run a simplified version of goseq using your own annotation
+#(http://bioconductor.org/packages/release/bioc/vignettes/goseq/inst/doc/goseq.pdf)
+
+#you need there packages available from bioconductor...
+library(goseq)
+library(GO.db)
+library(qvalue)
+
+#DE genes (without last "seq_." info) 
+factor_labeling = gsub("_seq.","",N2S_signif[,1])
+
+#Gene lengths are required because they influence the likeliness that a gene is diff. expressed. (again without last "seq_." info) 
+gene_lengths = idxstats[1:1000,2]
+names(gene_lengths) = gsub("_seq.","",idxstats[1:1000,1])
+
+#GO info for all genes (you could also subsample for genes expressed.)
+GO_info = read.table("../reference/genes1000.go_annotations.tsv", header=F, row.names=1,stringsAsFactors=F)
+
+#What is in GO_info? (you can search here: http://www.geneontology.org/ for specify go terms).
+#I generated this file using the Trinotate / blast steps from above.
+rownames(GO_info)[1]
+GO_info[1,1]
+
+#Reformat to a list containing a vector of GO for each gene.
+GO_info_listed = list()
+for(i in 1:nrow(GO_info))
+{
+  GO_info_listed[[i]] = strsplit(GO_info[i,1],",")[[1]]
+}
+names(GO_info_listed) = rownames(GO_info)
+
+#How many genes have GO info?
+genes_with_GO = rownames(GO_info)
+length(genes_with_GO)
+
+#Why do we not have 1000 genes with GO info?
+
+#Get the gene length for features_with_GO vector
+lengths_genes_with_GO = gene_lengths[genes_with_GO]
+
+#Build Probability weigthed function based on ALL DEG.
+#Calculates a Probability Weighting Function for a set of genes based on a given set of biased data (usually biased according to gene length).
+#Essentially the probability that a gene is differentially expressed goes up with gene length. So here we compute a function that accounts for this bias.
+cat_genes_vec = as.integer(genes_with_GO %in% factor_labeling)
+pwf=nullp(cat_genes_vec,bias.data=lengths_genes_with_GO,plot.fit= T)
+rownames(pwf) = names(GO_info_listed)
+
+#Run goseq
+#Testing for category enrichment amongst differentially expressed (DE) genes for RNA-seq data.
+goseq_results = goseq(pwf,gene2cat=GO_info_listed)
+
+#Correct for Multiple hypothesis testing, e.g.:
+goseq_results$over.p.adjust = p.adjust(goseq_results$over_represented_pvalue, method = "BH")
+
+#Or use qvalues (but some pvalues are >1... which caused qvalue estimate failure) 
+goseq_results$over_represented_pvalue[goseq_results$over_represented_pvalue >1] = 1
+goseq_results$over.qvalue = qvalue(goseq_results$over_represented_pvalue)$qvalue
+  
+#Diff Eepr. GOs. Lets look at them.
+head(goseq_results)  
+
+#How can we calculate proportion of proportion of "DEInCat" and proportion of "InCat"
+#DEInCat
+print(goseq_results[1,4]/(sum(cat_genes_vec)))
+
+#InCat     
+print(goseq_results[1,5]/(length(genes_with_GO)))
+      
+```
+
+
+
+####7.Can we look at what the DEG are? Functions?
+
+```{r, echo=T}
+#This is a file generated from the blast searches/annotations. 
+trinotate_annotation_report = read.table("../reference/trinotate_annotation_report.tsv",stringsAsFactors = F, sep = "\t",header = T,comment.char = "")
+
+#mMessy file with lots of info...It looks horrible...
+head(trinotate_annotation_report,2)
+colnames(trinotate_annotation_report)
+
+#We want to parse the third column: trinotate_annotation_report$sprot_Top_BLASTX_hit. It contains the results of the blast against all known proteins
+#hint, use strsplit
+strsplit(trinotate_annotation_report[2,3],"^",fixed = T)
+
+#Let's keep ONLY the description + genus name using strsplit in a loop...
+description_species = matrix(0,nrow = nrow(trinotate_annotation_report), ncol = 3)
+description_species[,1] = trinotate_annotation_report[,2] 
+for(i in 1:nrow(description_species))
+{
+  if(nchar(trinotate_annotation_report$sprot_Top_BLASTX_hit[i]) >10) {
+    
+    #description
+    description_species[i,2] = strsplit(trinotate_annotation_report[i,3],"^",fixed = T)[[1]][6]
+    
+    #full phylogeny (ugly)
+    phylo = strsplit(trinotate_annotation_report[i,3],"^",fixed = T)[[1]][7]
+    
+    #only genus (simpler)
+    description_species[i,3] = tail(strsplit(phylo,"; ")[[1]],1)
+    
+    #clean it up some more the description
+    description_species[i,2] = sub("RecName: Full=","",description_species[i,2])
+    }
+  
+}
+
+#What does our new matrix look like?
+head(description_species)
+
+###Let's add this info to the list of DEG
+#Create a matrix with 2 new columns. We will add info there...
+N2S_signif_description_species = cbind(N2S_signif,0,0)
+
+for(i in 1:nrow(N2S_signif))
+{
+    temp = description_species[,1] %in% N2S_signif[i,1]
+    if(length(temp[temp==T])==1)   N2S_signif_description_species[i,7:8] = description_species[temp == T,2:3]
+}
+
+#We have now annotations to your list of DEG!
+colnames(N2S_signif_description_species)[7:8] = c("description","genus") 
+head(N2S_signif_description_species)
+
+```
+
+
+
+###7.DESEQ2
+The package DESeq2 provides methods to test for differential expression by use of negative binomial generalized
+linear models (https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.pdf)
+
+As input, the DESeq2 package expects count data as obtained, e. g., from RNAseq
+or another high-throughput sequencing experiment, in the form of a matrix of
+integer values. The value in the i-th row and the j-th column of the matrix tells
+how many reads can be assigned to gene i in sample j.
+
+The values in the matrix should be un-normalized counts of sequencing reads
+(for single-end RNA-seq) or fragments (for paired-end RNA-seq). The RNA-seq
+workflow describes multiple techniques for preparing such count matrices. It is
+important to provide count matrices as input for DESeq2’s statistical model to
+hold, as only the count values allow assessing the measurement precision correctly.
+The DESeq2 model internally corrects for library size, so transformed or normalized
+values such as counts scaled by library size should not be used as input.
+
+DESeq2 normalization does not account for gene length, and there are sound reasons
+for making that choice when using the data for statistical hypothesis testing....  
+
+```{r, echo=T}
+
+#you need library DESeq2. 
+#You can install it from here: source("https://bioconductor.org/biocLite.R") ; biocLite("DESeq2")
+library(DESeq2)
+
+#Remember gene_expression_data object from previous analysis already contains raw data
+deseq_input_matrix = cbind(gene_expression_data$genes,gene_expression_data$counts)
+
+#Set up DESeq object
+expression_deseq_dataset = DESeqDataSetFromMatrix(deseq_input_matrix, DataFrame(group), ~ group,tidy = T)
+
+#Run DESeq and extract results
+expression_deseq = DESeq(expression_deseq_dataset)
+res_DEseq2 = results(expression_deseq)
+
+#Lets look at it:
+head(res_DEseq2)
+
+#Reorder according to pvalue and set na pvalues to 1
+res_DEseq2_reorder = res_DEseq2[order(res_DEseq2$pvalue),]
+res_DEseq2_reorder[is.na(res_DEseq2_reorder$padj),] = 1
+
+###How does this compare to the edgeR results?
+res_DEseq2_reorder_signif = res_DEseq2_reorder[res_DEseq2_reorder$padj <0.05,]
+
+###Let's compare edgeR and DESeq results.
+results_edgeR_deseq = cbind(unique(sort(c(rownames(res_DEseq2_reorder_signif),N2S_signif[,1]))),0,0)
+colnames(results_edgeR_deseq) = c("gene","edger","deseq2")
+
+for(i in 1:nrow(results_edgeR_deseq))
+{
+  temp_deseq2 = rownames(res_DEseq2_reorder_signif) %in% results_edgeR_deseq[i,1]
+  temp_edgeR = N2S_signif[,1] %in% results_edgeR_deseq[i,1]
+  
+  if(length(temp_edgeR[temp_edgeR==T]) == 1) results_edgeR_deseq[i,2] = 1
+  if(length(temp_deseq2[temp_deseq2==T]) == 1) results_edgeR_deseq[i,3] = 1
+}
+
+#What does it look like?
+print(head(results_edgeR_deseq,20))
+
+
+```
+
+###the end
